@@ -64,6 +64,23 @@ public:
         return read_array<T>(static_cast<size_t>(n));
     }
 
+    // UE's "bulk array" convention (distinct from FByteBulkData/the
+    // BulkDataMap): an explicit int32 element size, an int32 count,
+    // then count*element_size raw bytes -- used inline for classic
+    // mesh vertex/index buffers (FPositionVertexBuffer.Verts,
+    // FRawStaticIndexBuffer's indices, etc). The element size is
+    // validated against the caller's expectation, not trusted blindly.
+    template <class T>
+        requires std::is_trivially_copyable_v<T>
+    std::vector<T> read_bulk_array() {
+        int32_t elem_size = read<int32_t>();
+        int32_t n = read<int32_t>();
+        if (n < 0) fail("negative bulk array count");
+        if (n > 0 && static_cast<size_t>(elem_size) != sizeof(T))
+            fail("bulk array element size mismatch");
+        return read_array<T>(static_cast<size_t>(n));
+    }
+
     std::span<const uint8_t> bytes(size_t n) {
         need(n);
         auto s = data_.subspan(pos_, n);

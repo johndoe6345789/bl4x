@@ -12,6 +12,7 @@
 #include <string>
 
 #include "io/oodle.hpp"
+#include "pkg/mesh.hpp"
 #include "pkg/object.hpp"
 #include "pkg/package.hpp"
 #include "pkg/provider.hpp"
@@ -246,6 +247,14 @@ int cmd_find_export(bl4::Provider& p, const std::string& path, const std::string
     return 0;
 }
 
+int cmd_raw_props(bl4::Provider& p, const bl4::Usmap& usmap, const std::string& path, int index) {
+    bl4::Package* pkg = p.load_package(path);
+    if (!pkg) { std::cerr << "not found: " << path << "\n"; return 1; }
+    bl4::PropertyBag props = bl4::load_properties(*pkg, usmap, static_cast<uint32_t>(index));
+    (void)props;
+    return 0;
+}
+
 int cmd_texture(bl4::Provider& p, const bl4::Usmap& usmap, const std::string& path,
                 int index, const std::string& out_path) {
     bl4::Package* pkg = p.load_package(path);
@@ -330,6 +339,80 @@ int cmd_texture_batch(bl4::Provider& p, const bl4::Usmap& usmap, const std::stri
     return 0;
 }
 
+// Loads export 0's StaticMesh (or the first one found) of every path
+// listed in a file (one per line) -- for sampling geometry decode
+// robustness across many standalone mesh packages.
+int cmd_mesh_batch(bl4::Provider& p, const bl4::Usmap& usmap, const std::string& list_path) {
+    std::ifstream in(list_path);
+    std::string line;
+    long long ok = 0, failed = 0, tris = 0, nanite_ok = 0;
+    std::map<std::string, int> failure_reasons;
+    auto t0 = std::chrono::steady_clock::now();
+    while (std::getline(in, line)) {
+        if (line.empty()) continue;
+        bl4::Package* pkg = p.load_package(line);
+        if (!pkg) { ++failed; failure_reasons["package not found"]++; continue; }
+        uint32_t idx = UINT32_MAX;
+        for (uint32_t i = 0; i < pkg->export_count(); ++i)
+            if (pkg->resolve_object_name(pkg->export_at(i).class_index) == "StaticMesh") { idx = i; break; }
+        if (idx == UINT32_MAX) { ++failed; failure_reasons["no StaticMesh export"]++; continue; }
+        try {
+            bl4::MeshData mesh = bl4::load_static_mesh(*pkg, usmap, idx);
+            if (mesh.vertices.empty()) { ++failed; failure_reasons["empty mesh"]++; continue; }
+            ++ok;
+            if (mesh.is_nanite) ++nanite_ok;
+            tris += static_cast<long long>(mesh.indices.size() / 3);
+        } catch (const std::exception& e) {
+            ++failed;
+            std::string reason = e.what();
+            size_t paren = reason.find('(');
+            failure_reasons[paren != std::string::npos ? reason.substr(0, paren) : reason]++;
+        }
+    }
+    double secs = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
+    std::cout << "ok=" << ok << " (nanite=" << nanite_ok << ") failed=" << failed
+              << " tris=" << tris << " secs=" << secs << "\n";
+    for (auto& [reason, n] : failure_reasons) std::cout << "  " << n << "x " << reason << "\n";
+    return 0;
+}
+
+void write_obj(const bl4::MeshData& mesh, const std::string& path) {
+    std::ofstream out(path);
+    for (auto& v : mesh.vertices) out << "v " << v.px << " " << v.py << " " << v.pz << "\n";
+    for (auto& v : mesh.vertices) out << "vn " << v.nx << " " << v.ny << " " << v.nz << "\n";
+    for (auto& v : mesh.vertices) out << "vt " << v.uv[0].u << " " << v.uv[0].v << "\n";
+    for (auto& sec : mesh.sections) {
+        out << "g section_" << sec.material_index << "\n";
+        for (uint32_t t = 0; t < sec.num_triangles; ++t) {
+            uint32_t base = sec.first_index + t * 3;
+            if (base + 2 >= mesh.indices.size()) break;
+            uint32_t a = mesh.indices[base] + 1, b = mesh.indices[base + 1] + 1, c = mesh.indices[base + 2] + 1;
+            out << "f " << a << "/" << a << "/" << a << " " << b << "/" << b << "/" << b
+                << " " << c << "/" << c << "/" << c << "\n";
+        }
+    }
+}
+
+int cmd_mesh(bl4::Provider& p, const bl4::Usmap& usmap, const std::string& path,
+            int index, const std::string& out_path) {
+    bl4::Package* pkg = p.load_package(path);
+    if (!pkg) { std::cerr << "not found: " << path << "\n"; return 1; }
+    bl4::MeshData mesh = bl4::load_static_mesh(*pkg, usmap, static_cast<uint32_t>(index));
+    std::cout << "nanite=" << mesh.is_nanite << " verts=" << mesh.vertices.size()
+              << " tris=" << mesh.indices.size() / 3 << " sections=" << mesh.sections.size()
+              << " texcoords=" << mesh.num_tex_coords << "\n";
+    for (size_t i = 0; i < mesh.material_paths.size(); ++i)
+        std::cout << "  material[" << i << "]=" << mesh.material_paths[i] << "\n";
+    for (auto& s : mesh.sections)
+        std::cout << "  section mat=" << s.material_index << " first=" << s.first_index
+                  << " tris=" << s.num_triangles << "\n";
+    if (!out_path.empty()) {
+        write_obj(mesh, out_path);
+        std::cerr << "wrote " << out_path << "\n";
+    }
+    return 0;
+}
+
 int cmd_dump_bytes(bl4::Provider& p, const std::string& path, int index,
                    const std::string& out_path) {
     bl4::Package* pkg = p.load_package(path);
@@ -361,6 +444,19 @@ int main(int argc, char** argv) {
             bl4::Usmap usmap(kUsmapPath);
             int only = args.size() > 2 ? std::stoi(args[2]) : -1;
             return cmd_props(provider, usmap, args[1], only);
+        }
+        if (args[0] == "raw-props" && args.size() > 2) {
+            bl4::Usmap usmap(kUsmapPath);
+            return cmd_raw_props(provider, usmap, args[1], std::stoi(args[2]));
+        }
+        if (args[0] == "mesh" && args.size() > 2) {
+            bl4::Usmap usmap(kUsmapPath);
+            std::string out = args.size() > 3 ? args[3] : "";
+            return cmd_mesh(provider, usmap, args[1], std::stoi(args[2]), out);
+        }
+        if (args[0] == "mesh-batch" && args.size() > 1) {
+            bl4::Usmap usmap(kUsmapPath);
+            return cmd_mesh_batch(provider, usmap, args[1]);
         }
 
         if (args[0] == "walk" && args.size() > 2) {

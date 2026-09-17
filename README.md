@@ -108,9 +108,53 @@ crashes. See "Status" for exactly what is and isn't covered yet.
   are likewise rejected rather than guessed at, matching how rare they
   are in a UE5.6 game shipped in 2025.
 
+**Done and verified** -- mesh geometry (`bl4x mesh`/`mesh-batch`):
+- `UStaticMesh`'s binary tail up to and including `FStaticMeshRenderData`
+  (`pkg/mesh.cpp`): BodySetup/NavCollision/Sockets skip, then either
+  Nanite or classic geometry. `StaticMaterials` (for material-slot ->
+  asset-path mapping) turned out to already be available as a regular
+  tagged property, sidestepping the need to parse `UStaticMesh`'s far
+  more fragile *post*-RenderData tail (ray tracing proxy, Lumen card
+  data, distance fields) at all.
+- **Nanite cluster decode** (`pkg/nanite.hpp/.cpp`, `pkg/nanite_cluster.*`,
+  `pkg/nanite_bits.hpp`) -- the primary geometry format for BL4, since
+  most meshes are Nanite-only with fallback LODs stripped: page loading
+  (root pages inline, streaming pages via the shared bulk-data
+  mechanism, recursively resolved cross-page dependencies), the packed
+  (structure-of-array) cluster header, the generalized-triangle-strip
+  index decode, and per-vertex attribute decode (quantized position,
+  octahedral normal, quantized tangent angle, variable-bit-width vertex
+  color, the custom 20-bit UV float encoding) via three parallel
+  delta-coded byte planes (Low/Mid/High). Only emits the finest-LOD
+  ("leaf", `EdgeLength < 0`) clusters, matching the reference exporter.
+- **Classic (non-Nanite) LOD decode** (`pkg/static_mesh_lod.*`): the
+  fallback path for the minority of meshes that still carry it --
+  position/tangent-basis/UV/color vertex buffers and a 16- or 32-bit
+  index buffer, both the inline and separately-bulk-data-backed forms.
+- Verified on real BL4 content, not just structurally: a 500-mesh random
+  sample decodes 493/500 (the 7 failures are packages with no
+  `StaticMesh` export at all -- a sampling artifact, not a decode bug),
+  6.6M triangles total, 390 of them via the Nanite path. Spot-checked a
+  53,659-triangle Nanite mesh (`SM_Elpis_Crater_01`) byte-for-byte
+  plausibility: every decoded normal is unit-length to 6 decimal places
+  across all 38,003 vertices (a strong correctness signal for the
+  octahedral-unpack + quantization math), the position bounding box
+  matches a crater's expected shape, and every triangle index is in
+  range.
+- Known gap: BC6H/BC7 Nanite vertex-color/UV layers aren't reachable
+  (color/UV use a dedicated encoding, not BC textures) so this doesn't
+  apply to mesh data; the analogous gap here is voxel/brick clusters
+  (`bVoxel`), which for BL4's UE5.5 engine version reduces to "cluster
+  has zero triangles" (voxel Nanite is a UE5.6+ feature) -- skipping
+  them costs nothing for BL4 content specifically, unlike a future,
+  newer UE5.6+ title.
+- Known gap, fixed along the way: `TPerPlatformProperty<T>` structs
+  (`FPerPlatformInt`/`Float`/`Bool` -- used by e.g. `UStaticMesh.MinLOD`)
+  have a custom `Serialize()`, not a tagged property list, and were
+  previously misparsed as a generic usmap struct; `pkg/property.cpp`
+  now special-cases them like the other hardcoded engine structs.
+
 **Not yet ported** (still only in the C# `Exporter`):
-- Static mesh LOD and Nanite cluster decode (turning a mesh reference
-  into actual vertex/index buffers).
 - glTF (.glb) writer (JSON placement writing is done: `write_placements_json`).
 - Landscape and spline mesh baking (`ULandscapeComponent`'s own tail --
   grass data, platform data -- and `USplineMeshComponent`'s bend math
@@ -159,7 +203,10 @@ bl4x census-props [limit]         # property-decode-only census across cells
 bl4x texture <path> <idx> <out.dds>  # decode one Texture2D export -> DDS
 bl4x texture-census [limit]       # texture decode census across cells
 bl4x texture-batch <list.txt>     # texture decode census for a path list
+bl4x mesh <path> <idx> [out.obj]  # decode one StaticMesh export -> stats + optional OBJ
+bl4x mesh-batch <list.txt>        # mesh decode census for a path list
 bl4x find-export <path> <class>   # list export indices matching a class (debug)
+bl4x raw-props <path> <idx>       # print any export's tagged properties, needs BL4X_TRACE=1 (debug)
 bl4x dumpbytes <path> <idx> <out> # raw bytes of one export (debug)
 ```
 
@@ -192,6 +239,11 @@ src/world/walker.*        actor/component tree -> world-space placements,
                           transform composition, JSON writer
 src/pkg/texture.*         UTexture2D/FTexturePlatformData decode, DDS writer
 src/pkg/virtual_texture.* FVirtualTextureBuiltData parse + tile assembly
+src/pkg/mesh.*            UStaticMesh entry point, Nanite/classic dispatch
+src/pkg/nanite.*          FNaniteResources, page loading/orchestration
+src/pkg/nanite_cluster.*  one packed cluster's header/decode/vertex-resolve
+src/pkg/nanite_bits.hpp   Nanite's bit/byte-level decode primitives
+src/pkg/static_mesh_lod.* classic (non-Nanite) vertex/index buffer decode
 src/pkg/bc_decode.*       BC1/BC3/BC4/BC5 software block decoders
 src/main.cpp              CLI
 ```

@@ -195,6 +195,31 @@ PropertyValue read_struct(Reader& r, const Usmap& usmap, Package& pkg,
         v.v3 = zero ? Vec3{} : Vec3{double(r.read<int32_t>()), double(r.read<int32_t>()), 0};
         return v;
     }
+    if (t == "PerPlatformInt" || t == "PerPlatformFloat" || t == "PerPlatformBool") {
+        // TPerPlatformProperty<T> has a custom Serialize(), not a tagged
+        // property list: bool bCooked, T Default, then (only if !bCooked
+        // and this package keeps editor-only data) a Map<FName,T> of
+        // per-platform overrides we don't need and just skip past.
+        if (zero) {
+            v.kind = t == "PerPlatformBool" ? PropertyValue::Kind::Bool
+                    : t == "PerPlatformFloat" ? PropertyValue::Kind::Double : PropertyValue::Kind::Int;
+            return v;
+        }
+        bool cooked = r.read_bool();
+        if (t == "PerPlatformInt") { v.kind = PropertyValue::Kind::Int; v.i = r.read<int32_t>(); }
+        else if (t == "PerPlatformFloat") { v.kind = PropertyValue::Kind::Double; v.d = r.read<float>(); }
+        else { v.kind = PropertyValue::Kind::Bool; v.b = r.read_bool(); }
+        if (!cooked && pkg.is_filter_editor_only()) {
+            int32_t count = r.read_count();
+            for (int32_t i = 0; i < count; ++i) {
+                r.skip(8);  // FName key (name index + extra)
+                if (t == "PerPlatformInt") r.read<int32_t>();
+                else if (t == "PerPlatformFloat") r.read<float>();
+                else r.read_bool();
+            }
+        }
+        return v;
+    }
 
     // Generic (usmap-defined) struct: recurse using the exact same
     // unversioned reader, keyed by struct name instead of class name.
