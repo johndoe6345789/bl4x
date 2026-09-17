@@ -1,6 +1,7 @@
 #include "pkg/package.hpp"
 
 #include <algorithm>
+#include <cstdio>
 #include <cstring>
 #include <iostream>
 
@@ -178,6 +179,55 @@ std::string Package::resolve_object_name(ObjIndex idx) {
     auto r = resolve_export(idx);
     if (!r) return "<unresolved>";
     return r->first->resolve(r->first->exports_[r->second].object_name);
+}
+
+namespace {
+constexpr uint32_t kBulkUnused = 1u << 5;
+constexpr uint32_t kBulkPayloadInSeparateFile = 1u << 8;
+constexpr uint32_t kBulkOptionalPayload = 1u << 11;
+constexpr uint32_t kBulkMemoryMapped = 1u << 12;
+
+std::string without_extension(const std::string& path) {
+    size_t dot = path.find_last_of('.');
+    size_t slash = path.find_last_of('/');
+    return (dot != std::string::npos && (slash == std::string::npos || dot > slash))
+        ? path.substr(0, dot) : path;
+}
+}  // namespace
+
+std::vector<uint8_t> Package::read_bulk_data(Reader& r, int32_t data_index) {
+    if (data_index < 0 || static_cast<size_t>(data_index) >= bulk_data_map_.size())
+        throw std::runtime_error("bulk data index out of range");
+    const BulkDataEntry& e = bulk_data_map_[static_cast<size_t>(data_index)];
+    if (e.serial_size == 0 || (e.flags & kBulkUnused)) return {};
+
+    const char* ext = nullptr;
+    if ((e.flags & kBulkPayloadInSeparateFile) && (e.flags & kBulkMemoryMapped)) ext = "m.ubulk";
+    else if (e.flags & kBulkPayloadInSeparateFile) ext = "ubulk";
+    else if (e.flags & kBulkOptionalPayload) ext = "uptnl";
+
+    if (!ext) {
+        // ForceInlinePayload (or LazyLoadable/None): the data is the
+        // next serial_size bytes of the CURRENT stream, right where
+        // the index was read -- SerialOffset plays no part here.
+        auto bytes = r.bytes(static_cast<size_t>(e.serial_size));
+        return {bytes.begin(), bytes.end()};
+    }
+
+    std::string base = without_extension(path_);
+    std::string sibling = e.cooked_index == 0
+        ? base + "." + ext
+        : base + "." + [i = e.cooked_index] {
+              char buf[8]; std::snprintf(buf, sizeof(buf), "%03u", i); return std::string(buf);
+          }() + "." + ext;
+    std::vector<uint8_t> file;
+    if (!provider_.read_raw_file(sibling, file))
+        throw std::runtime_error("missing bulk sibling file " + sibling);
+    uint64_t offset = file.size() == e.serial_size ? 0 : e.serial_offset;
+    if (offset + e.serial_size > file.size())
+        throw std::runtime_error("bulk data range out of bounds in " + sibling);
+    return {file.begin() + static_cast<ptrdiff_t>(offset),
+           file.begin() + static_cast<ptrdiff_t>(offset + e.serial_size)};
 }
 
 std::string Package::virtual_path() const {

@@ -16,6 +16,7 @@ namespace bl4 {
 
 class IoStore;
 class Provider;
+class Reader;
 struct BulkDataEntry {
     uint64_t serial_offset;
     uint64_t duplicate_serial_offset;
@@ -81,6 +82,18 @@ public:
     // this package's own name map (no package/global tag), plus the
     // "_N" suffix number CUE4Parse calls the "extra" index.
     std::string resolve_local_name(int32_t name_index, int32_t extra) const;
+
+    // Resolves one FByteBulkDataHeader's worth of data, given the
+    // int32 index just read from `r` (an index into bulk_data_map()).
+    // BULKDATA_ForceInlinePayload (and LazyLoadable/None) data is the
+    // next serial_size bytes of `r` itself, starting right where the
+    // index was read -- this consumes them from `r`, exactly as
+    // CUE4Parse's TBulkData ctor advances Ar.Position past inline
+    // payloads so the caller's subsequent reads land correctly.
+    // Anything else (PayloadInSeperateFile/OptionalPayload/mapped)
+    // lives in a sibling .ubulk/.uptnl/.m.ubulk file and leaves `r`
+    // untouched.
+    std::vector<uint8_t> read_bulk_data(Reader& r, int32_t data_index);
 
     // TODO(next phase): deserialize export i's own properties on
     // demand (unversioned property reader + usmap-driven struct

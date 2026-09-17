@@ -15,6 +15,7 @@
 #include "pkg/object.hpp"
 #include "pkg/package.hpp"
 #include "pkg/provider.hpp"
+#include "pkg/texture.hpp"
 #include "pkg/usmap.hpp"
 #include "world/walker.hpp"
 
@@ -235,6 +236,100 @@ int cmd_walk_census(bl4::Provider& p, const bl4::Usmap& usmap, int limit) {
     return 0;
 }
 
+int cmd_find_export(bl4::Provider& p, const std::string& path, const std::string& class_name) {
+    bl4::Package* pkg = p.load_package(path);
+    if (!pkg) { std::cerr << "not found: " << path << "\n"; return 1; }
+    for (uint32_t i = 0; i < pkg->export_count(); ++i) {
+        if (pkg->resolve_object_name(pkg->export_at(i).class_index) == class_name)
+            std::cout << i << " " << pkg->resolve(pkg->export_at(i).object_name) << "\n";
+    }
+    return 0;
+}
+
+int cmd_texture(bl4::Provider& p, const bl4::Usmap& usmap, const std::string& path,
+                int index, const std::string& out_path) {
+    bl4::Package* pkg = p.load_package(path);
+    if (!pkg) { std::cerr << "not found: " << path << "\n"; return 1; }
+    bl4::TextureData tex = bl4::load_texture(*pkg, usmap, static_cast<uint32_t>(index));
+    std::cout << tex.width << "x" << tex.height << " " << tex.pixel_format
+              << " mips=" << tex.mips.size() << " srgb=" << tex.srgb << "\n";
+    bl4::write_dds(tex, out_path);
+    std::cout << "wrote " << out_path << "\n";
+    return 0;
+}
+
+// Loads every Texture2D export in `limit` cells (plus their imported
+// texture packages, reached via the mesh materials scan), to sanity-
+// check texture decode at scale.
+int cmd_texture_census(bl4::Provider& p, const bl4::Usmap& usmap, int limit) {
+    auto t0 = std::chrono::steady_clock::now();
+    std::vector<std::string> cells = p.find_paths("world_p/_generated_/");
+    std::vector<std::string> umaps;
+    for (auto& c : cells)
+        if (c.size() > 5 && c.compare(c.size() - 5, 5, ".umap") == 0) umaps.push_back(c);
+    std::sort(umaps.begin(), umaps.end());
+    if (limit > 0 && static_cast<size_t>(limit) < umaps.size()) umaps.resize(static_cast<size_t>(limit));
+
+    long long ok = 0, failed = 0, bytes = 0;
+    std::map<std::string, int> failure_reasons;
+    for (auto& path : umaps) {
+        bl4::Package* pkg = p.load_package(path);
+        if (!pkg) continue;
+        for (uint32_t i = 0; i < pkg->export_count(); ++i) {
+            if (pkg->resolve_object_name(pkg->export_at(i).class_index) != "Texture2D") continue;
+            try {
+                bl4::TextureData tex = bl4::load_texture(*pkg, usmap, i);
+                ++ok;
+                for (auto& m : tex.mips) bytes += static_cast<long long>(m.data.size());
+            } catch (const std::exception& e) {
+                ++failed;
+                std::string reason = e.what();
+                size_t paren = reason.find('(');
+                failure_reasons[paren != std::string::npos ? reason.substr(0, paren) : reason]++;
+            }
+        }
+    }
+    double secs = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
+    std::cout << "cells=" << umaps.size() << " ok=" << ok << " failed=" << failed
+              << " bytes=" << bytes << " secs=" << secs << "\n";
+    for (auto& [reason, n] : failure_reasons) std::cout << "  " << n << "x " << reason << "\n";
+    return 0;
+}
+
+// Loads export 0 of every path listed in a file (one per line) as a
+// texture -- for sampling across many standalone texture packages
+// rather than just what a handful of cells happen to embed.
+int cmd_texture_batch(bl4::Provider& p, const bl4::Usmap& usmap, const std::string& list_path) {
+    std::ifstream in(list_path);
+    std::string line;
+    long long ok = 0, failed = 0, bytes = 0;
+    std::map<std::string, int> failure_reasons;
+    auto t0 = std::chrono::steady_clock::now();
+    while (std::getline(in, line)) {
+        if (line.empty()) continue;
+        bl4::Package* pkg = p.load_package(line);
+        if (!pkg) { ++failed; failure_reasons["package not found"]++; continue; }
+        uint32_t idx = UINT32_MAX;
+        for (uint32_t i = 0; i < pkg->export_count(); ++i)
+            if (pkg->resolve_object_name(pkg->export_at(i).class_index) == "Texture2D") { idx = i; break; }
+        if (idx == UINT32_MAX) { ++failed; failure_reasons["no Texture2D export"]++; continue; }
+        try {
+            bl4::TextureData tex = bl4::load_texture(*pkg, usmap, idx);
+            ++ok;
+            for (auto& m : tex.mips) bytes += static_cast<long long>(m.data.size());
+        } catch (const std::exception& e) {
+            ++failed;
+            std::string reason = e.what();
+            size_t paren = reason.find('(');
+            failure_reasons[paren != std::string::npos ? reason.substr(0, paren) : reason]++;
+        }
+    }
+    double secs = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
+    std::cout << "ok=" << ok << " failed=" << failed << " bytes=" << bytes << " secs=" << secs << "\n";
+    for (auto& [reason, n] : failure_reasons) std::cout << "  " << n << "x " << reason << "\n";
+    return 0;
+}
+
 int cmd_dump_bytes(bl4::Provider& p, const std::string& path, int index,
                    const std::string& out_path) {
     bl4::Package* pkg = p.load_package(path);
@@ -271,6 +366,20 @@ int main(int argc, char** argv) {
         if (args[0] == "walk" && args.size() > 2) {
             bl4::Usmap usmap(kUsmapPath);
             return cmd_walk(provider, usmap, args[1], args[2]);
+        }
+        if (args[0] == "find-export" && args.size() > 2)
+            return cmd_find_export(provider, args[1], args[2]);
+        if (args[0] == "texture-batch" && args.size() > 1) {
+            bl4::Usmap usmap(kUsmapPath);
+            return cmd_texture_batch(provider, usmap, args[1]);
+        }
+        if (args[0] == "texture-census") {
+            bl4::Usmap usmap(kUsmapPath);
+            return cmd_texture_census(provider, usmap, args.size() > 1 ? std::stoi(args[1]) : 0);
+        }
+        if (args[0] == "texture" && args.size() > 3) {
+            bl4::Usmap usmap(kUsmapPath);
+            return cmd_texture(provider, usmap, args[1], std::stoi(args[2]), args[3]);
         }
         if (args[0] == "walk-census") {
             bl4::Usmap usmap(kUsmapPath);

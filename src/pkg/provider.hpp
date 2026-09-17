@@ -38,6 +38,11 @@ public:
     // Every indexed path whose lowercase form contains needle.
     std::vector<std::string> find_paths(const std::string& needle_lower) const;
 
+    // Raw chunk bytes for any indexed path (case-insensitive) -- used
+    // for a package's sibling .ubulk/.uptnl bulk-data files, which
+    // aren't packages themselves and need no structural parsing.
+    bool read_raw_file(const std::string& path, std::vector<uint8_t>& out) const;
+
 private:
     struct Loc { IoStore* container; uint32_t chunk; };
 

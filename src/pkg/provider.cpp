@@ -100,6 +100,13 @@ Package* Provider::load_package_by_id(uint64_t package_id) {
     return raw;
 }
 
+bool Provider::read_raw_file(const std::string& path, std::vector<uint8_t>& out) const {
+    auto it = files_.find(lower(path));
+    if (it == files_.end()) return false;
+    out = it->second.container->read(it->second.chunk);
+    return true;
+}
+
 std::vector<std::string> Provider::find_paths(const std::string& needle_lower) const {
     std::vector<std::string> out;
     for (auto& [k, v] : files_)

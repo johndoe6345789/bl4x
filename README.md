@@ -71,6 +71,43 @@ crashes. See "Status" for exactly what is and isn't covered yet.
   dropped rather than emitted; `walk-census`'s `bad` counter tracks
   this if it needs revisiting.
 
+**Done and verified** -- texture layer (`bl4x texture`/`texture-census`/`texture-batch`):
+- `UTexture`/`UTexture2D`/`FTexturePlatformData` deserialize, per-mip
+  bulk data resolution (inline `ForceInlinePayload` consumed straight
+  from the current read stream; `.ubulk`/`.uptnl`/`.m.ubulk` sibling
+  files otherwise), and DDS (BC1/3/4/5/6H/7, B8G8R8A8/R8G8B8A8/G8)
+  writing (`pkg/texture.*`).
+- **Virtual Texture decode** (`pkg/virtual_texture.*`, `pkg/bc_decode.*`):
+  the overwhelming majority of BL4's world/material textures ship with
+  an empty regular mip array and their pixel data in an
+  `FVirtualTextureBuiltData` tiled atlas instead (Morton/Z-order
+  addressed pages with a per-tile border to trim on assembly). Parses
+  the modern (UE5) per-mip addressing path, resolves each resident
+  tile's bulk data the same way as a regular mip, decodes BC1/BC3/BC4/
+  BC5 blocks (hand-written, no external decoder) plus the uncompressed
+  8/32-bit-per-pixel layer formats, and stitches them into one flat
+  RGBA8 bitmap for the requested mip level.
+- Verified byte-exact on a real texture (`T_1x1_Grid`, regular mips:
+  11,064-byte DDS output matches the sum of all 8 known-correct mip
+  sizes plus the header exactly) and by output-size and pixel-variance
+  sanity checks across hundreds of VT textures (`T_GunToter_Armor_AORM`:
+  2048x2048 R8G8B8A8, DDS size matches `2048*2048*4 + header` exactly;
+  spatially-varying, non-degenerate pixel data confirmed by sampling).
+- `bl4x texture-census 300`: went from 30/390 Texture2D exports
+  loading (mostly landscape heightmaps/weightmaps plus general VT
+  material textures, both previously misreported as "no resident mip
+  data") to 303/390, with every remaining failure being the single,
+  clearly-identified `PF_BC6H` gap below.
+- Known gap: BC6H (HDR block compression, used by some VT layers --
+  likely skyboxes/lightmap-adjacent content) and BC7 aren't decoded;
+  both need large partition/endpoint tables that are easy to
+  transcribe wrong with no ground-truth decoder to diff against, unlike
+  every other layer in this tool, so they're left as an explicit,
+  loud failure (`unsupported VT layer pixel format`) rather than a
+  silent wrong-pixel risk. Deprecated VT codecs (`ZippedGPU`, `Crunch`)
+  are likewise rejected rather than guessed at, matching how rare they
+  are in a UE5.6 game shipped in 2025.
+
 **Not yet ported** (still only in the C# `Exporter`):
 - Static mesh LOD and Nanite cluster decode (turning a mesh reference
   into actual vertex/index buffers).
@@ -119,6 +156,10 @@ bl4x props <path> [exportIndex]   # print component transforms/instances (debug)
 bl4x walk <path> <out.json>       # full placement walk for one cell -> JSON
 bl4x walk-census [limit]          # walk across all (or first `limit`) cells
 bl4x census-props [limit]         # property-decode-only census across cells
+bl4x texture <path> <idx> <out.dds>  # decode one Texture2D export -> DDS
+bl4x texture-census [limit]       # texture decode census across cells
+bl4x texture-batch <list.txt>     # texture decode census for a path list
+bl4x find-export <path> <class>   # list export indices matching a class (debug)
 bl4x dumpbytes <path> <idx> <out> # raw bytes of one export (debug)
 ```
 
@@ -149,6 +190,9 @@ src/pkg/object.*          per-class binary tails (Actor/Component GUID,
                           ULevel.Actors, UWorld.PersistentLevel)
 src/world/walker.*        actor/component tree -> world-space placements,
                           transform composition, JSON writer
+src/pkg/texture.*         UTexture2D/FTexturePlatformData decode, DDS writer
+src/pkg/virtual_texture.* FVirtualTextureBuiltData parse + tile assembly
+src/pkg/bc_decode.*       BC1/BC3/BC4/BC5 software block decoders
 src/main.cpp              CLI
 ```
 
