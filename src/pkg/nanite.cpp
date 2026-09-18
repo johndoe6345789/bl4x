@@ -1,5 +1,9 @@
 #include "pkg/nanite.hpp"
 
+#include <iostream>
+
+#include <cstdlib>
+
 #include <stdexcept>
 
 #include "core/reader.hpp"
@@ -114,8 +118,10 @@ Page* NaniteResources::get_page(uint32_t index) {
                         ? &parent->clusters[local_cluster_index] : nullptr;
                 });
         }
-    } catch (const std::exception&) {
+    } catch (const std::exception& e) {
         ok = false;
+        if (std::getenv("BL4X_TRACE_NANITE"))
+            std::cerr << "  nanite page " << index << " failed: " << e.what() << "\n";
     }
 
     loading_[index] = 0;
@@ -167,9 +173,10 @@ RawNaniteMesh load_nanite_mesh(Reader& r, Package& pkg) {
     res.init_page_cache();
 
     uint32_t vert_offset = 0;
+    uint32_t pages_failed = 0;
     for (uint32_t p = 0; p < res.page_streaming_states.size(); ++p) {
         Page* page = res.get_page(p);
-        if (!page) continue;
+        if (!page) { ++pages_failed; continue; }
         for (auto& c : page->clusters) {
             if (c.is_voxel || c.edge_length >= 0.0f) continue;  // only finest-LOD (leaf) clusters
             uint32_t base = vert_offset;
@@ -180,6 +187,12 @@ RawNaniteMesh load_nanite_mesh(Reader& r, Package& pkg) {
             for (auto& v : c.vertices) raw.vertices.push_back(v);
             vert_offset += static_cast<uint32_t>(c.vertices.size());
         }
+    }
+    if (std::getenv("BL4X_TRACE_NANITE")) {
+        std::cerr << "  nanite pages=" << res.page_streaming_states.size()
+                  << " root=" << res.num_root_pages << " failed=" << pages_failed
+                  << " streamable_bytes=" << res.streamable_pages.size()
+                  << " tris=" << raw.triangles.size() << "\n";
     }
     return raw;
 }

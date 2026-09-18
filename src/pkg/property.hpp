@@ -58,6 +58,7 @@ public:
     ObjIndex get_object(const std::string& name) const;
     std::vector<ObjIndex> get_object_array(const std::string& name) const;
     std::string get_str(const std::string& name, std::string def = "") const;
+    const std::unordered_map<std::string, PropertyValue>& all() const { return props_; }
 
 private:
     std::unordered_map<std::string, PropertyValue> props_;

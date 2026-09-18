@@ -154,6 +154,19 @@ crashes. See "Status" for exactly what is and isn't covered yet.
   previously misparsed as a generic usmap struct; `pkg/property.cpp`
   now special-cases them like the other hardcoded engine structs.
 
+**Material -> texture** (`pkg/material.*`): a mesh section's
+`UMaterialInstanceConstant` is followed through `TextureParameterValues`
+and then its `Parent`, up to 8 hops, scoring each bound texture by
+parameter name (`BaseColor`/`Albedo`/`Diffuse` beat a `_D`/`_BC` texture
+name, which beats a bare "colour"); normal/roughness/comp/mask/emissive
+parameters are rejected outright. That is *one* texture, not BL4's
+actual shading: these are layered materials (`MaterialLayers`/`Blends`
+with colourisation, grime and wear layers) whose graph this doesn't
+evaluate. 102 of 114 materials in the default test region resolve; the
+misses are emissive fixtures and foliage that only binds a packed
+"Composite" map. `pkg/texture_export.*` writes the chosen mip (<= 1024
+px, halved on the CPU if needed) as a plain 32-bit TGA.
+
 **Not yet ported** (still only in the C# `Exporter`):
 - glTF (.glb) writer (JSON placement writing is done: `write_placements_json`).
 - Landscape and spline mesh baking (`ULandscapeComponent`'s own tail --
@@ -201,6 +214,10 @@ bl4x walk <path> <out.json>       # full placement walk for one cell -> JSON
 bl4x walk-census [limit]          # walk across all (or first `limit`) cells
 bl4x census-props [limit]         # property-decode-only census across cells
 bl4x texture <path> <idx> <out.dds>  # decode one Texture2D export -> DDS
+bl4x material <path>              # print a material instance chain's properties
+bl4x bake <out> <tile_m> <cell.umap>...   # bake cells -> models/textures/tiles
+bl4x bake-all <out> <tile_m>              # ... every World_P cell (16,863)
+bl4x find-cells <max_hits> <pattern>...   # locate cells by mesh-name substring
 bl4x texture-census [limit]       # texture decode census across cells
 bl4x texture-batch <list.txt>     # texture decode census for a path list
 bl4x mesh <path> <idx> [out.obj]  # decode one StaticMesh export -> stats + optional OBJ
@@ -238,6 +255,8 @@ src/pkg/object.*          per-class binary tails (Actor/Component GUID,
 src/world/walker.*        actor/component tree -> world-space placements,
                           transform composition, JSON writer
 src/pkg/texture.*         UTexture2D/FTexturePlatformData decode, DDS writer
+src/pkg/texture_export.*  decoded mip -> RGBA8 TGA (capped size)
+src/pkg/material.*        material instance chain -> base-colour texture
 src/pkg/virtual_texture.* FVirtualTextureBuiltData parse + tile assembly
 src/pkg/mesh.*            UStaticMesh entry point, Nanite/classic dispatch
 src/pkg/nanite.*          FNaniteResources, page loading/orchestration

@@ -190,6 +190,7 @@ TriResult decode_triangle(std::span<const uint8_t> page, int64_t strip_base,
         uint32_t found_new_vertex = found_num_prev_new_vertices + static_cast<uint32_t>(
             (is_found_case_s != 0) ? (is_left & (found_num_ref_vertices == 0 ? 1 : 0)) : -1);
         x = condition ? found_index : found_new_vertex;
+        if (is_left != 0) std::swap(y, z);  // a left turn flips strip winding
     }
 
     // Canonical rotation: smallest index leads (preserves winding).

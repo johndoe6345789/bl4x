@@ -332,10 +332,84 @@ PropertyValue read_value(Reader& r, const Usmap& usmap, Package& pkg,
             }
             return v;
         }
+        case EPropType::Set: {
+            // TSet: the removal list first (empty in cooked data, but it
+            // is still written), then the elements, each read exactly as
+            // an array element.
+            v.kind = PropertyValue::Kind::Array;
+            if (zero || !type.inner) return v;
+            int32_t removed = r.read_count();
+            for (int32_t i = 0; i < removed; ++i) read_value(r, usmap, pkg, *type.inner, false);
+            int32_t count = r.read_count();
+            v.arr.reserve(static_cast<size_t>(count));
+            for (int32_t i = 0; i < count; ++i)
+                v.arr.push_back(read_value(r, usmap, pkg, *type.inner, false));
+            return v;
+        }
+        case EPropType::Map: {
+            // TMap, same shape: removed keys, then key/value pairs. Kept
+            // as a flat array of {key, value} bags -- nothing this tool
+            // reads wants a map, it just has to consume the right bytes.
+            v.kind = PropertyValue::Kind::Array;
+            if (zero || !type.key || !type.value) return v;
+            int32_t removed = r.read_count();
+            for (int32_t i = 0; i < removed; ++i) read_value(r, usmap, pkg, *type.key, false);
+            int32_t count = r.read_count();
+            v.arr.reserve(static_cast<size_t>(count));
+            for (int32_t i = 0; i < count; ++i) {
+                PropertyValue pair;
+                pair.kind = PropertyValue::Kind::Bag;
+                pair.bag = std::make_shared<PropertyBag>();
+                pair.bag->set("Key", read_value(r, usmap, pkg, *type.key, false));
+                pair.bag->set("Value", read_value(r, usmap, pkg, *type.value, false));
+                v.arr.push_back(std::move(pair));
+            }
+            return v;
+        }
         default:
             throw ParseError("unsupported property type " +
                              std::to_string(static_cast<int>(type.type)));
     }
+}
+
+// A handful of BL4's own structs carry no unversioned header at all:
+// every property, including those inherited from a super struct, is
+// written in index order with no zero mask (CUE4Parse calls this a "raw
+// header" -- see FRawHeader.FullRead and Borderlands4Structs.cs, whose
+// list this mirrors). Read as a normal fragment header they misparse,
+// and since GbxNavGeometrySettings hangs off USceneComponent, that took
+// down every component in cells that have one -- including the
+// landscape's own Nanite mesh.
+bool raw_header_struct(const std::string& type_name) {
+    return type_name == "GbxNavGeometrySettings" || type_name == "SToken" ||
+           type_name == "FactAddress" || type_name == "GbxAttributeExpression" ||
+           type_name == "GbxBlackboardEntryRef" || type_name == "GbxActorStateMachineKey";
+}
+
+// Its super chain's properties count too (FRawHeader's SuperStructs).
+int total_property_count(const Usmap& usmap, const UsmapStruct* s) {
+    int total = 0;
+    while (s) {
+        total += s->own_property_count;
+        s = s->super_type.empty() ? nullptr : usmap.find(s->super_type);
+    }
+    return total;
+}
+
+PropertyBag read_raw_header_properties(Reader& r, const Usmap& usmap, Package& pkg,
+                                       const std::string& type_name, const UsmapStruct* s,
+                                       int limit) {
+    PropertyBag bag;
+    const int total = limit > 0 ? limit : total_property_count(usmap, s);
+    for (int index = 0; index < total; ++index) {
+        const UsmapProperty* prop = nullptr;
+        if (!find_property(usmap, s, index, prop)) {
+            throw ParseError("raw-header struct '" + type_name + "' has no property " +
+                             std::to_string(index));
+        }
+        bag.set(prop->name, read_value(r, usmap, pkg, prop->type, false));
+    }
+    return bag;
 }
 
 }  // namespace
@@ -345,6 +419,15 @@ PropertyBag read_unversioned_properties(Reader& r, const Usmap& usmap,
     PropertyBag bag;
     const UsmapStruct* s = usmap.find(type_name);
     if (!s) throw ParseError("no usmap mapping for '" + type_name + "'");
+
+    if (raw_header_struct(type_name)) {
+        return read_raw_header_properties(r, usmap, pkg, type_name, s, 0);
+    }
+    // GbxActorStateMachineStateKey is the same idea, but only its first
+    // property is written (FRawHeader([(0,1)])).
+    if (type_name == "GbxActorStateMachineStateKey") {
+        return read_raw_header_properties(r, usmap, pkg, type_name, s, 1);
+    }
 
     UnversionedHeader header = read_header(r);
     if (!header.has_values) return bag;

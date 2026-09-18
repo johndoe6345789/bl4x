@@ -1,8 +1,10 @@
 #include "world/walker.hpp"
 
 #include <cmath>
+#include <cstdlib>
 #include <fstream>
 #include <iostream>
+#include <optional>
 #include <unordered_map>
 
 #include "pkg/object.hpp"
@@ -78,9 +80,14 @@ void append_gltf(std::vector<float>& out, const XForm& x) {
 struct Node {
     Package* pkg = nullptr;
     uint32_t index = 0;
+    std::string component_class;
     PropertyBag props;
     std::vector<Instance> instances;
     ObjIndex attach_parent;
+    // Set when attached to a socket on the parent's mesh (e.g. a pipe
+    // piece on the previous piece's "TL_End_01"): the socket's own
+    // transform sits between this component and its parent.
+    std::string attach_socket;
     bool visited = false;  // cycle guard while resolving world transform
     bool has_world = false;
     XForm world;
@@ -102,7 +109,12 @@ public:
         PropertyBag props;
         try {
             props = load_properties(pkg, usmap_, actor_index);
-        } catch (const std::exception&) { ++out_.unsupported; return; }
+        } catch (const std::exception& e) {
+            ++out_.unsupported;
+            if (std::getenv("BL4X_TRACE"))
+                std::cerr << "  actor " << cls << ": " << e.what() << "\n";
+            return;
+        }
 
         std::vector<ObjIndex> refs;
         if (auto o = props.get_object("RootComponent"); !o.is_null()) refs.push_back(o);
@@ -110,8 +122,33 @@ public:
         for (auto o : props.get_object_array("InstanceComponents")) if (!o.is_null()) refs.push_back(o);
         for (auto o : props.get_object_array("BlueprintCreatedComponents")) if (!o.is_null()) refs.push_back(o);
         for (auto o : props.get_object_array("LandscapeComponents")) if (!o.is_null()) refs.push_back(o);
+        // UE 5.5 landscapes keep a Nanite static mesh of the terrain
+        // beside their heightfield components -- the only ground BL4
+        // ships as geometry, and reachable from nowhere else.
+        for (auto o : props.get_object_array("NaniteComponents")) if (!o.is_null()) refs.push_back(o);
+        if (auto o = props.get_object("NaniteComponent"); !o.is_null()) refs.push_back(o);
+        // Landscape spline actors hang their road/path meshes off their
+        // own component lists.
+        for (auto o : props.get_object_array("ControlPointMeshComponents")) if (!o.is_null()) refs.push_back(o);
+        for (auto o : props.get_object_array("SegmentMeshComponents")) if (!o.is_null()) refs.push_back(o);
 
         for (ObjIndex ref : refs) visit_component(pkg, ref);
+    }
+
+    // Components the actor lists do not reach -- spline meshes hang off
+    // landscape splines, river bodies and blueprint pipes by routes the
+    // actor walk does not follow -- visited straight from the export
+    // table. Their transforms still come from their AttachParent chain.
+    void add_loose_components(Package& pkg) {
+        for (uint32_t i = 0; i < pkg.export_count(); ++i) {
+            const std::string cls = pkg.resolve_object_name(pkg.export_at(i).class_index);
+            if (cls == "SplineMeshComponent" || cls == "WaterSplineComponent" ||
+                cls == "WaterBodyCustomComponent") {
+                ObjIndex idx;
+                idx.raw = i;  // an export of this package
+                visit_component(pkg, idx);
+            }
+        }
     }
 
     void finish() {
@@ -148,6 +185,7 @@ private:
         Node node;
         node.pkg = pkg;
         node.index = index;
+        node.component_class = cls;
         try {
             ComponentData c = load_component(*pkg, usmap_, index, cls);
             node.props = std::move(c.props);
@@ -160,6 +198,7 @@ private:
             ++out_.hidden;
         }
         node.attach_parent = node.props.get_object("AttachParent");
+        node.attach_socket = node.props.get_str("AttachSocketName");
         auto [ins, ok] = nodes_.emplace(key, std::move(node));
         return &ins->second;
     }
@@ -178,7 +217,16 @@ private:
             Node* pnode = parent ? visit_component(*parent->first, n.attach_parent) : nullptr;
             if (pnode) {
                 resolve_world({pnode->pkg, pnode->index});
-                n.world = normalize(combine(local, pnode->world));
+                XForm parent_world = pnode->world;
+                // Without the socket, a chain of socket-attached pieces all
+                // lands on its root, and each piece's scale compounds --
+                // the sockets carry the inverse scale (a 2.54x pipe piece
+                // sits on a 0.3937 socket), so ignoring them grew pipe
+                // chains to kilometres.
+                if (!n.attach_socket.empty() && n.attach_socket != "None")
+                    if (auto sock = socket_transform(*pnode, n.attach_socket))
+                        parent_world = normalize(combine(*sock, parent_world));
+                n.world = normalize(combine(local, parent_world));
             } else {
                 n.world = local;  // parent outside our set (or native): treat as top-level
             }
@@ -186,22 +234,60 @@ private:
         n.has_world = true;
     }
 
+    // A UStaticMeshSocket's transform relative to its mesh, found among
+    // the mesh package's StaticMeshSocket exports by SocketName.
+    std::optional<XForm> socket_transform(Node& parent, const std::string& socket) {
+        ObjIndex mesh = parent.props.get_object("StaticMesh");
+        if (mesh.is_null()) return std::nullopt;
+        auto target = parent.pkg->resolve_export(mesh);
+        if (!target) return std::nullopt;
+        Package* mesh_pkg = target->first;
+        const std::string key = mesh_pkg->path() + "|" + socket;
+        auto cached = sockets_.find(key);
+        if (cached != sockets_.end()) return cached->second;
+        std::optional<XForm> found;
+        for (uint32_t i = 0; i < mesh_pkg->export_count() && !found; ++i) {
+            if (mesh_pkg->resolve_object_name(mesh_pkg->export_at(i).class_index) != "StaticMeshSocket")
+                continue;
+            try {
+                PropertyBag sp = load_properties(*mesh_pkg, usmap_, i);
+                if (sp.get_str("SocketName") != socket) continue;
+                XForm x;
+                x.t = sp.get_vec3("RelativeLocation");
+                x.r = normalize_quat(rotator_to_quat(sp.get_vec3("RelativeRotation")));
+                x.s = sp.get_vec3("RelativeScale", {1, 1, 1});
+                found = x;
+            } catch (const std::exception&) {
+            }
+        }
+        sockets_[key] = found;
+        return found;
+    }
+
     void emit(Node& n) {
         if (!n.has_world) return;
         bool hidden = !n.props.get_bool("bVisible", true) || n.props.get_bool("bHiddenInGame");
+        if (hidden) return;
+        if (n.component_class == "WaterSplineComponent") { emit_lake(n); return; }
         ObjIndex mesh = n.props.get_object("StaticMesh");
-        if (mesh.is_null() || hidden) return;
+        // A custom water body draws WaterMeshOverride (BL4: a Gearbox swim
+        // plane) scaled to the water's extent, at the water's height.
+        if (mesh.is_null() && n.component_class == "WaterBodyCustomComponent")
+            mesh = n.props.get_object("WaterMeshOverride");
+        if (mesh.is_null()) return;
+        if (n.component_class == "SplineMeshComponent") { emit_spline_mesh(n, mesh); return; }
         std::string mesh_path = n.pkg->resolve_asset_path(mesh);
         std::vector<std::string> materials;
         for (auto m : n.props.get_object_array("OverrideMaterials"))
             materials.push_back(m.is_null() ? "" : n.pkg->resolve_asset_path(m));
 
-        std::string key = mesh_path;
+        std::string key = mesh_path + "#" + n.component_class;
         for (auto& m : materials) key += "|" + m;
         auto pit = placement_index_.find(key);
         Placement* p;
         if (pit == placement_index_.end()) {
-            out_.entries.push_back({"mesh", mesh_path, materials, {}});
+            const char* kind = n.component_class == "WaterBodyCustomComponent" ? "water" : "mesh";
+            out_.entries.push_back({kind, mesh_path, n.component_class, materials, {}, {}, {}});
             placement_index_[key] = out_.entries.size() - 1;
             p = &out_.entries.back();
         } else {
@@ -222,10 +308,88 @@ private:
         }
     }
 
+    // One entry per spline mesh: each is bent differently, so none share.
+    void emit_spline_mesh(Node& n, ObjIndex mesh) {
+        if (!finite_xform(n.world)) return;
+        Placement p{"spline_mesh", n.pkg->resolve_asset_path(mesh), n.component_class, {}, {}, {}, {}};
+        for (auto m : n.props.get_object_array("OverrideMaterials"))
+            p.materials.push_back(m.is_null() ? "" : n.pkg->resolve_asset_path(m));
+        const PropertyValue* params = n.props.find("SplineParams");
+        const PropertyBag empty;
+        const PropertyBag& sp = (params && params->bag) ? *params->bag : empty;
+        auto push3 = [&](const Vec3& v) {
+            p.spline.insert(p.spline.end(), {float(v.x), float(v.y), float(v.z)});
+        };
+        auto push2 = [&](const Vec3& v) { p.spline.insert(p.spline.end(), {float(v.x), float(v.y)}); };
+        push3(sp.get_vec3("StartPos"));
+        push3(sp.get_vec3("StartTangent"));
+        push3(sp.get_vec3("EndPos"));
+        push3(sp.get_vec3("EndTangent"));
+        push2(sp.get_vec3("StartScale", {1, 1, 0}));
+        push2(sp.get_vec3("EndScale", {1, 1, 0}));
+        push2(sp.get_vec3("StartOffset"));
+        push2(sp.get_vec3("EndOffset"));
+        p.spline.push_back(float(sp.get_double("StartRoll")));
+        p.spline.push_back(float(sp.get_double("EndRoll")));
+        const PropertyValue* axis = n.props.find("ForwardAxis");
+        p.spline.push_back(axis ? float(axis->i) : 0.f);
+        push3(n.props.get_vec3("SplineUpDir", {0, 0, 1}));
+        p.spline.push_back(float(n.props.get_double("SplineBoundaryMin")));
+        p.spline.push_back(float(n.props.get_double("SplineBoundaryMax")));
+        p.spline.push_back(n.props.get_bool("bSmoothInterpRollScale") ? 1.f : 0.f);
+        p.spline.resize(kSplineParamCount, 0.f);
+        append_gltf(p.xforms, n.world);
+        out_.entries.push_back(std::move(p));
+    }
+
+    // A lake's surface is built at runtime from its spline outline
+    // (WaterBodyLakeComponent.LakeMeshComp is null in cooked data); only
+    // the spline under a lake body is a lake -- rivers use spline meshes.
+    void emit_lake(Node& n) {
+        if (n.attach_parent.is_null() || !finite_xform(n.world)) return;
+        auto parent = n.pkg->resolve_export(n.attach_parent);
+        if (!parent) return;
+        const std::string parent_class =
+            parent->first->resolve_object_name(parent->first->export_at(parent->second).class_index);
+        if (parent_class != "WaterBodyLakeComponent") return;
+        const PropertyValue* curves = n.props.find("SplineCurves");
+        if (!curves || !curves->bag) return;
+        const PropertyValue* position = curves->bag->find("position");
+        if (!position) position = curves->bag->find("Position");
+        if (!position || !position->bag) return;
+        const PropertyValue* points = position->bag->find("points");
+        if (!points) points = position->bag->find("Points");
+        if (!points || points->arr.size() < 3) return;
+
+        Placement p{"lake", "lake:" + n.pkg->path() + "#" + std::to_string(n.index),
+                    n.component_class, {}, {}, {}, {}};
+        const size_t count = points->arr.size();
+        for (size_t i = 0; i < count; ++i) {
+            const PropertyValue& a = points->arr[i];
+            const PropertyValue& b = points->arr[(i + 1) % count];  // lakes are closed loops
+            if (!a.bag || !b.bag) return;
+            const Vec3 p0 = a.bag->get_vec3("OutVal"), t0 = a.bag->get_vec3("LeaveTangent");
+            const Vec3 p1 = b.bag->get_vec3("OutVal"), t1 = b.bag->get_vec3("ArriveTangent");
+            const bool linear = a.bag->find("InterpMode") && a.bag->find("InterpMode")->i == 0;
+            const int steps = linear ? 1 : 8;
+            for (int s = 0; s < steps; ++s) {  // the segment's end is the next one's start
+                const double t = double(s) / steps, t2 = t * t, t3 = t2 * t;
+                const double h00 = 2 * t3 - 3 * t2 + 1, h10 = t3 - 2 * t2 + t;
+                const double h01 = -2 * t3 + 3 * t2, h11 = t3 - t2;
+                p.outline.push_back(float(h00 * p0.x + h10 * t0.x + h01 * p1.x + h11 * t1.x));
+                p.outline.push_back(float(h00 * p0.y + h10 * t0.y + h01 * p1.y + h11 * t1.y));
+                p.outline.push_back(float(h00 * p0.z + h10 * t0.z + h01 * p1.z + h11 * t1.z));
+            }
+        }
+        append_gltf(p.xforms, n.world);
+        out_.entries.push_back(std::move(p));
+    }
+
     const Usmap& usmap_;
     CellPlacements& out_;
     std::unordered_map<Key, Node, KeyHash> nodes_;
     std::unordered_map<std::string, size_t> placement_index_;
+    std::unordered_map<std::string, std::optional<XForm>> sockets_;
 };
 
 }  // namespace
@@ -262,6 +426,7 @@ CellPlacements walk_cell(Package& pkg, const Usmap& usmap, const std::string& ce
     for (ObjIndex actor : actors)
         if (!actor.is_null())
             if (auto resolved = pkg.resolve_export(actor)) walker.add_actor(*resolved->first, resolved->second);
+    walker.add_loose_components(pkg);
     walker.finish();
     return out;
 }
@@ -279,7 +444,8 @@ void write_placements_json(const CellPlacements& cell, const std::string& path) 
     for (size_t i = 0; i < cell.entries.size(); ++i) {
         const Placement& p = cell.entries[i];
         if (i) f << ",";
-        f << "{\"kind\":\"" << esc(p.kind) << "\",\"mesh\":\"" << esc(p.mesh) << "\",\"materials\":[";
+        f << "{\"kind\":\"" << esc(p.kind) << "\",\"mesh\":\"" << esc(p.mesh)
+          << "\",\"component\":\"" << esc(p.component) << "\",\"materials\":[";
         for (size_t j = 0; j < p.materials.size(); ++j)
             f << (j ? "," : "") << "\"" << esc(p.materials[j]) << "\"";
         f << "],\"xforms\":[";
